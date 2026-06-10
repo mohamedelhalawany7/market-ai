@@ -1,0 +1,56 @@
+// schema.prisma - تعريف نماذج قاعدة البيانات
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// نموذج المستخدم - يمثل مصنع الغزل أو النسيج
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String
+  company   String
+  createdAt DateTime @default(now())
+}
+
+// نموذج المادة الخام (قطن، بوليستر، إلخ)
+model Material {
+  id           Int            @id @default(autoincrement())
+  name         String         @unique
+  nameEn       String
+  unit         String
+  priceHistory PriceHistory[]
+  predictions  Prediction[]
+  createdAt    DateTime       @default(now())
+}
+
+// نموذج السجل التاريخي للأسعار
+model PriceHistory {
+  id         Int      @id @default(autoincrement())
+  material   Material @relation(fields: [materialId], references: [id])
+  materialId Int
+  price      Float
+  currency   String   @default("EGP")
+  recordedAt DateTime @default(now())
+
+  @@index([materialId, recordedAt])
+}
+
+// نموذج توقعات الأسعار من نموذج Prophet
+model Prediction {
+  id          Int      @id @default(autoincrement())
+  material    Material @relation(fields: [materialId], references: [id])
+  materialId  Int
+  predictedAt DateTime
+  yhat        Float
+  yhatLower   Float
+  yhatUpper   Float
+  createdAt   DateTime @default(now())
+
+  @@index([materialId, predictedAt])
+}
