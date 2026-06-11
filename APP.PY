@@ -250,8 +250,12 @@ if not firebase_admin._apps:
         st.toast(f"⚠️ تعذر الاتصال بالسحابة ({e}). النظام يعمل بوضع 'الذاكرة المؤقتة'.", icon="🚨")
         FIREBASE_CONNECTED = False
 else:
-    db = firestore.client()
-    FIREBASE_CONNECTED = True
+    try:
+        db = firestore.client()
+        FIREBASE_CONNECTED = True
+    except Exception:
+        db = None
+        FIREBASE_CONNECTED = False
 
 if 'offline_db' not in st.session_state:
     st.session_state.offline_db = {'Workspaces': {}, 'System': {'Licenses': {'workspaces': {}}}}
@@ -314,8 +318,18 @@ def sync_offline_to_firebase():
     
     safe_id = "".join(c for c in str(ws_id) if c.isalnum() or c in ('_', '-'))
     has_synced = False
+    synced_chats = []
     
     try:
+        # الابتكار الثالث (Debouncer): تفريغ المصدات الشاملة في عملية كتابة واحدة
+        if 'pending_fs_updates' in st.session_state and st.session_state.pending_fs_updates:
+            try:
+                db.collection('Mudir_Workspaces').document(safe_id).update(st.session_state.pending_fs_updates)
+                st.session_state.pending_fs_updates.clear()
+            except Exception:
+                db.collection('Mudir_Workspaces').document(safe_id).set(st.session_state.pending_fs_updates, merge=True)
+                st.session_state.pending_fs_updates.clear()
+
         # 1. مزامنة إعدادات الشركة
         if safe_id in off_db.get('Workspaces', {}):
             data = off_db['Workspaces'][safe_id]
@@ -323,25 +337,31 @@ def sync_offline_to_firebase():
                 db.collection('Mudir_Workspaces').document(safe_id).set(data, merge=True)
                 has_synced = True
 
-        # 2. مزامنة المحادثات العالقة
+        # 2. مزامنة المحادثات العالقة (الحل المبتكر: بصمة البيانات المؤجلة لحماية Quota)
         if 'Chats' in off_db and off_db['Chats']:
-            for u_key, c_data in off_db['Chats'].items():
-                db.collection('Mudir_Workspaces').document(safe_id).collection('Chats').document(u_key).set(c_data, merge=True)
+            for u_key, c_data in list(off_db['Chats'].items()):
+                data_string = json.dumps(c_data, sort_keys=True, default=str)
+                current_hash = hashlib.md5(data_string.encode()).hexdigest()
+                hash_key = f"hash_{u_key}"
+                
+                if st.session_state.get(hash_key) != current_hash:
+                    db.collection('Mudir_Workspaces').document(safe_id).collection('Chats').document(u_key).set(c_data, merge=True)
+                    st.session_state[hash_key] = current_hash
+                synced_chats.append(u_key)
             has_synced = True
 
         # 3. مزامنة السجل السري اللحظي (Logs) باستخدام تقنية Batch
+        logs_processed = 0
         if 'Logs' in off_db and off_db['Logs']:
             batch = db.batch()
-            count = 0
             for log_id, entry in off_db['Logs']:
                 doc_ref = db.collection('Mudir_Workspaces').document(safe_id).collection('Logs').document(log_id)
                 batch.set(doc_ref, entry)
-                count += 1
-                if count >= 450:
+                logs_processed += 1
+                if logs_processed % 450 == 0:
                     batch.commit()
                     batch = db.batch()
-                    count = 0
-            if count > 0: batch.commit()
+            if logs_processed % 450 != 0: batch.commit()
             has_synced = True
 
         # 4. مزامنة التراخيص
@@ -349,12 +369,17 @@ def sync_offline_to_firebase():
             db.collection('Mudir_System').document('Licenses').set(off_db['System']['Licenses'], merge=True)
             has_synced = True
 
-        # مسح الذاكرة المحلية إذا تمت المزامنة بنجاح
+        # مسح الذاكرة المحلية للعناصر التي تمت مزامنتها فقط لتجنب الـ Race Condition
         if has_synced:
-            st.session_state.offline_db = {'Workspaces': {}, 'System': {'Licenses': {'workspaces': {}}}, 'Chats': {}, 'Logs': []}
-            # تم إزالة (st.toast) نهائياً لتعمل المزامنة بصمت تام في الخلفية دون إزعاج المدير
+            off_db['Workspaces'].pop(safe_id, None)
+            for k in synced_chats:
+                off_db['Chats'].pop(k, None)
+            if 'Logs' in off_db:
+                del off_db['Logs'][:logs_processed]
     except Exception:
-        pass
+        # حماية إضافية: مسح المحادثات التي نجحت مزامنتها حتى لو فشل شيء آخر لاحقاً
+        for k in synced_chats:
+            off_db['Chats'].pop(k, None)
 
 # =====================================================================
 # SYSTEM PROMPT V2: The Smart Tagging Protocol
@@ -399,15 +424,24 @@ def load_config():
     }
     if 'workspace_id' in st.session_state:
         try:
-            doc = get_workspace_doc().get()
-            if doc.exists:
-                data = doc.to_dict()
+            # إصلاح: حماية استهلاك Firebase (Quota) بعمل كاش لمدة 60 ثانية للإعدادات
+            current_time = time.time()
+            if 'cached_ws_doc' not in st.session_state or current_time - st.session_state.get('cached_ws_time', 0) > 60:
+                doc = get_workspace_doc().get()
+                if doc.exists:
+                    st.session_state.cached_ws_doc = doc.to_dict()
+                    st.session_state.cached_ws_time = current_time
+                else:
+                    st.session_state.cached_ws_doc = {}
+
+            if 'cached_ws_doc' in st.session_state and st.session_state.cached_ws_doc:
+                data = st.session_state.cached_ws_doc.copy()
                 for k in ['ALL_CHATS', 'AUDIT_LOG']:
                     if k in data: del data[k]
                 defaults.update(data)
                 
                 # Decrypt Passwords
-                for k in ['ODOO_PASS', 'MANAGER_PIN']:
+                for k in ['MANAGER_PIN']: # إبقاء ODOO_PASS مشفراً في الذاكرة الحية (Session State)
                     val = defaults.get(k, '')
                     if val and is_encrypted(val):
                         defaults[k] = decrypt_password(val)
@@ -450,21 +484,66 @@ def get_employee_memory(curr_user):
 
 def append_employee_memory(curr_user, new_memo):
     current_memo = get_employee_memory(curr_user)
+    
+    # الابتكار الأول: منع تكرار نفس المعلومة تماماً لحفظ الذاكرة
+    if current_memo and new_memo.strip() in current_memo:
+        return
+        
     updated_memo = f"{current_memo} | {new_memo}" if current_memo else new_memo
     
-    # زيادة مساحة الذاكرة الاستراتيجية للمدير لمنع تلاشي المعلومات القديمة بسرعة
+    # الابتكار الثاني: التقليم الدلالي (Semantic Pruning) لمنع النسيان وبتر الكلمات
     if len(updated_memo) > 3000:
-        # الاحتفاظ بأول 100 حرف (تأسيسية) وآخر 2800 حرف (حديثة)
-        updated_memo = updated_memo[:100] + " ... [تم اختصار السجلات] ... " + updated_memo[-2800:]
+        parts = [p.strip() for p in updated_memo.split(" | ") if p.strip()]
+        if len(parts) > 2:
+            first_part = parts[0] # الاحتفاظ بالأساسيات
+            recent_parts = []
+            current_len = len(first_part) + 15
+            for p in reversed(parts[1:]):
+                if current_len + len(p) < 2800:
+                    recent_parts.insert(0, p)
+                    current_len += len(p) + 3
+                else:
+                    break
+            updated_memo = first_part + " | ... | " + " | ".join(recent_parts)
+        else:
+            updated_memo = updated_memo[:100] + " ... " + updated_memo[-2800:]
         
     st.session_state.app_config.setdefault('MEMORIES', {})[curr_user] = updated_memo
-    if FIREBASE_CONNECTED and db and 'workspace_id' in st.session_state:
-        try: get_workspace_doc().update({f'MEMORIES.{curr_user}': updated_memo})
-        except Exception: pass
+    
+    # توجيه الحفظ إلى المصدات الشاملة (Debouncer) بدلاً من الفايربيز المباشر
+    if 'pending_fs_updates' not in st.session_state: st.session_state.pending_fs_updates = {}
+    st.session_state.pending_fs_updates[f'MEMORIES.{curr_user}'] = updated_memo
 
 def save_chat_for_user(user_key):
     if 'workspace_id' in st.session_state:
-        chats = st.session_state.all_chats.get(user_key, [])[-35:]
+        all_msgs = st.session_state.all_chats.get(user_key, [])
+        
+        # الابتكار الرابع: الأرشفة الانزلاقية للمحادثات (Sliding Window)
+        if len(all_msgs) > 35:
+            first_msg = all_msgs[0]
+            recent_msgs = all_msgs[-34:]
+            chats = [first_msg] + recent_msgs
+            st.session_state.all_chats[user_key] = chats
+        else:
+            chats = all_msgs
+            
+        safe_chats = []
+        for msg in chats:
+            safe_msg = msg.copy()
+            if safe_msg.get('image'): safe_msg['image'] = "[صورة محفوظة بالجلسة]"
+            safe_chats.append(safe_msg)
+        if 'Chats' not in st.session_state.offline_db: st.session_state.offline_db['Chats'] = {}
+        st.session_state.offline_db['Chats'][user_key] = {'messages': safe_chats}
+
+def overwrite_chat_for_user(user_key, chats):
+    if 'workspace_id' in st.session_state:
+        # تطبيق الأرشفة الانزلاقية هنا أيضاً
+        if len(chats) > 35:
+            first_msg = chats[0]
+            recent_msgs = chats[-34:]
+            chats = [first_msg] + recent_msgs
+            st.session_state.all_chats[user_key] = chats
+            
         safe_chats = []
         for msg in chats:
             safe_msg = msg.copy()
@@ -565,9 +644,10 @@ def update_task_status(task_id, new_status, action_user):
         if safe_id not in st.session_state.offline_db['Workspaces']:
             st.session_state.offline_db['Workspaces'][safe_id] = {}
         st.session_state.offline_db['Workspaces'][safe_id].setdefault('GLOBAL_TASKS', {})[task_id] = task
-        if FIREBASE_CONNECTED and db:
-            try: get_workspace_doc().update(fs_updates)
-            except: pass
+        
+        # توجيه التحديثات الحية إلى المصدات الشاملة لمنع انهيار Quota الفايربيز
+        if 'pending_fs_updates' not in st.session_state: st.session_state.pending_fs_updates = {}
+        st.session_state.pending_fs_updates.update(fs_updates)
 
 ALL_NAV_ITEMS = [
     ("dashboard", "dashboard", "لوحة القيادة"),
@@ -729,9 +809,11 @@ def call_universal_ai(messages, json_mode=False):
                     else:
                         ant_messages.append(new_msg)
             
-            # حماية نهائية: إذا كانت المصفوفة فارغة تماماً
+            # حماية نهائية: إذا كانت المصفوفة فارغة تماماً أو تنتهي برد مساعد
             if not ant_messages:
                 ant_messages.append({"role": "user", "content": "مرحبا"})
+            elif ant_messages[-1]["role"] == "assistant":
+                ant_messages.append({"role": "user", "content": "الرجاء المتابعة."})
                     
             safe_model = model_name if "claude" in model_name.lower() else "claude-3-haiku-20240307"
             
@@ -1016,6 +1098,10 @@ def style_dataframe(df):
     if hasattr(df, 'data'): df_raw = df.data.copy()
     else: df_raw = df.copy()
     if df_raw.empty: return df_raw
+
+    # حماية: إزالة الأعمدة المكررة لتفادي خطأ AttributeError للـ DataFrame
+    if df_raw.columns.duplicated().any():
+        df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
 
     # حماية النظام من الاختناق: تلوين وتنسيق أقوى 500 نتيجة فقط كحد أقصى (لضمان سرعة فورية)
     if len(df_raw) > 500:
@@ -1754,7 +1840,8 @@ if st.session_state.get('view') not in ['workspace_login', 'super_admin', 'login
     CFG = st.session_state.app_config
     if not st.session_state.get('data_loaded'):
         with st.spinner('جاري تهيئة النواة وربط الخوادم لاستخراج بيانات Odoo...'):
-            df_s_raw, df_p_raw, df_i_raw, df_po_raw, df_pol_raw, extra_dfs, is_real = fetch_master_data(CFG.get('ODOO_URL',''), CFG.get('ODOO_DB',''), CFG.get('ODOO_USER',''), CFG.get('ODOO_PASS',''), CFG)
+            o_pass_decrypted = decrypt_password(CFG.get('ODOO_PASS','')) if is_encrypted(CFG.get('ODOO_PASS','')) else CFG.get('ODOO_PASS','')
+            df_s_raw, df_p_raw, df_i_raw, df_po_raw, df_pol_raw, extra_dfs, is_real = fetch_master_data(CFG.get('ODOO_URL',''), CFG.get('ODOO_DB',''), CFG.get('ODOO_USER',''), o_pass_decrypted, CFG)
             st.session_state.df_s = df_s_raw
             st.session_state.df_p = df_p_raw
             st.session_state.df_i = df_i_raw
@@ -1776,17 +1863,17 @@ if st.session_state.get('view') not in ['workspace_login', 'super_admin', 'login
         st.markdown(f"""<div class="sidebar-brand"><div class="brand-logo">{get_icon("chart", 32, "var(--c-primary)")}</div><div class="brand-name">MUDIR</div><div class="brand-ver">OS Kernel v52.2 Quantum</div></div>""", unsafe_allow_html=True)
         st.markdown(f"""<div style="text-align:center; color:var(--c-primary); font-weight:bold; margin-bottom:20px; font-size:0.9rem;">مرحباً: {st.session_state.current_user.split(" - ")[0]}</div>""", unsafe_allow_html=True)
 
-        if st.session_state.current_user and st.session_state.current_user != "المدير العام":
-            user_notifs = CFG.get('NOTIFICATIONS', {}).get(st.session_state.current_user, [])
-            unread_count = len(user_notifs)
-            
-            if unread_count > 0:
-                with st.expander(f"🔔 إشعارات جديدة ({unread_count})", expanded=True):
-                    st.markdown("<div style='text-align:center; color:#ff2d78; font-weight:bold; margin-bottom:10px;'>الإشعارات غير المقروءة</div>", unsafe_allow_html=True)
-                    for notif in reversed(user_notifs):
-                        st.markdown(f"<div style='background:rgba(0, 242, 255, 0.05); border-right:3px solid #00f2ff; padding:10px; margin-bottom:8px; border-radius:4px; font-size:0.85rem; line-height:1.5; color:#e2e8f0;'>{notif}</div>", unsafe_allow_html=True)
-                    if st.button("تحديد الكل كمقروء ✔️", use_container_width=True):
-                        st.session_state.app_config.setdefault('NOTIFICATIONS', {})[st.session_state.current_user] = []
+        # الحل المبتكر: حقن حاوية الإشعارات العكسية (Reverse Injection)
+        sidebar_notif_placeholder = st.empty()
+        st.session_state['sidebar_notif_placeholder'] = sidebar_notif_placeholder
+        
+        with sidebar_notif_placeholder.container():
+            if st.session_state.current_user and st.session_state.current_user != "المدير العام":
+                user_notifs = CFG.get('NOTIFICATIONS', {}).get(st.session_state.current_user, [])
+                unread_count = len(user_notifs)
+                
+                if unread_count > 0:
+                    with st.expander(f"🔔 إشعارات جديدة ({unread_count})", expanded=True):
                         if FIREBASE_CONNECTED and db:
                             try:
                                 get_workspace_doc().update({f'NOTIFICATIONS.{st.session_state.current_user}': []})
@@ -2829,8 +2916,14 @@ def advanced_text_extraction(uploaded_file):
         if ext == 'pdf':
             import PyPDF2
             reader = PyPDF2.PdfReader(uploaded_file)
+            page_count = 0
             for page in reader.pages:
+                # إصلاح: حماية النظام من الانهيار (MemoryError) بقراءة 50 صفحة كحد أقصى للـ PDF
+                if page_count >= 50:
+                    text += "\n[تنبيه النظام: تم إيقاف القراءة عند 50 صفحة لحماية الذاكرة من الانهيار]\n"
+                    break
                 text += page.extract_text() + "\n"
+                page_count += 1
         elif ext in ['txt', 'md', 'json', 'csv']:
             text = uploaded_file.getvalue().decode('utf-8', errors='ignore')
         elif ext in ['docx', 'doc']:
@@ -2862,10 +2955,15 @@ def advanced_text_extraction(uploaded_file):
                 for sheet_name in sheet_names:
                     df = xl.parse(sheet_name, dtype=str).fillna('-')
                     cols = [str(c) for c in df.columns]
+                    row_count = 0
                     for row in df.values.tolist():
+                        if row_count > 500:
+                            text += f"\n[تنبيه: تم إيقاف القراءة في شيت {sheet_name} عند 500 صف لحماية الذاكرة]\n"
+                            break
                         # الحل العبقري: حقن اسم الشيت مع الأعمدة في كل سطر لضمان احتفاظ المقطع بالسياق مهما تم تقطيعه
                         row_strs = [f"{cols[i]}: {str(row[i]).replace(chr(10), ' ')}" for i in range(len(cols))]
                         text += f"[شيت: {sheet_name}] | " + ' | '.join(row_strs) + "\n"
+                        row_count += 1
                     
             except Exception as e:
                 return None, f"خطأ في قراءة ملف Excel: {e}"
@@ -2947,83 +3045,83 @@ def render_fusion():
             status_text = st.empty()
             
             try:
-                # 1. Extraction
-                status_text.text("1/4: جاري فك تشفير واستخراج النصوص من الملف...")
-                print(f"[DEBUG] بدء استخراج النص من {uploaded_file.name}")
-                raw_text, error = advanced_text_extraction(uploaded_file)
+                ext = uploaded_file.name.split('.')[-1].lower()
                 
-                if error:
-                    st.error(f"❌ فشل الاستخراج: {error}")
-                    status_text.empty()
-                    progress_bar.empty()
-                else:
-                    progress_bar.progress(25)
-                    
-                    # 2. Chunking
-                    status_text.text("2/4: جاري تقطيع النص وتحسين الجودة (Smart Chunking)...")
-                    chunks = smart_chunk_text(raw_text)
-                    print(f"[DEBUG] تم استخراج النص وتقطيعه إلى {len(chunks)} مقاطع دقيقة.")
-                    progress_bar.progress(50)
-                    
-                    # 3. Embeddings
-                    status_text.text("3/4: جاري تحويل النصوص إلى متجهات ذكية (Embeddings)...")
-                    emb_key = CFG.get('OPENAI_EMBEDDING_KEY', '').strip() or CFG.get('AI_API_KEY', '').strip()
-                    emb_url = CFG.get('EMBEDDING_PROVIDER_URL', 'https://api.openai.com/v1').strip()
-                    emb_model = CFG.get('EMBEDDING_MODEL_NAME', 'text-embedding-3-small').strip()
-                    if emb_key.startswith("AIza") and ("text-embedding-3" in emb_model or "004" in emb_model or "embedding-001" == emb_model):
-                        emb_model = "gemini-embedding-2"
-                        
-                    response_data = get_universal_embeddings(chunks, emb_key, emb_url, emb_model)
-                    print(f"[DEBUG] تم إنشاء الـ Embeddings بنجاح.")
-                    progress_bar.progress(75)
-                    
-                    # 4. Storage
-                    status_text.text("4/4: جاري التخزين والفهرسة داخل محرك Pinecone...")
+                if ext == 'pdf':
+                    # الحل المبتكر: "التدفق المباشر للذاكرة المتجهة" لحماية الخادم من انهيار PDF العملاق
+                    status_text.text("1/4 & 2/4: جاري قراءة وتقطيع الـ PDF بالتدفق المباشر (لحماية الذاكرة)...")
+                    import PyPDF2
+                    reader = PyPDF2.PdfReader(uploaded_file)
+                    batch_text = ""
+                    page_count = 0
+                    total_chunks = 0
                     idx = get_pinecone_index()
                     file_id = f"file_{int(time.time())}"
                     ws_namespace = str(st.session_state.get('workspace_id', 'default'))
                     
-                    vectors = []
-                    for item in response_data:
-                        i = item['index']
-                        emb_val = item['embedding']
-                        vec_id = f"{file_id}_chunk_{i}"
+                    emb_key = CFG.get('OPENAI_EMBEDDING_KEY', '').strip() or CFG.get('AI_API_KEY', '').strip()
+                    emb_url = CFG.get('EMBEDDING_PROVIDER_URL', 'https://api.openai.com/v1').strip()
+                    emb_model = CFG.get('EMBEDDING_MODEL_NAME', 'text-embedding-3-small').strip()
+                    if emb_key.startswith("AIza") and ("text-embedding-3" in emb_model or "004" in emb_model or "embedding-001" == emb_model or not emb_model):
+                        emb_model = "gemini-embedding-2"
+
+                    for page in reader.pages:
+                        batch_text += page.extract_text() + "\n"
+                        page_count += 1
                         
-                        # --- الحل العبقري 2: حماية الفهرس الشامل (Bonus Marker) ---
-                        # نقوم بتحديد إذا كان هذا المقطع يحتوي على "فهرس ملف الإكسيل الشامل"
-                        is_master_index = "فهرس ملف الإكسيل الشامل" in chunks[i]
+                        # معالجة ورفع كل 20 صفحة، ثم إفراغ الذاكرة فوراً لمنع الانهيار
+                        if page_count % 20 == 0:
+                            status_text.text(f"جاري معالجة وتخزين {page_count} صفحة...")
+                            chunks = smart_chunk_text(batch_text)
+                            if chunks:
+                                total_chunks += len(chunks)
+                                response_data = get_universal_embeddings(chunks, emb_key, emb_url, emb_model)
+                                vectors = []
+                                for item in response_data:
+                                    vectors.append((f"{file_id}_c_{page_count}_{item['index']}", item['embedding'], {"text": chunks[item['index']], "filename": uploaded_file.name, "file_id": file_id}))
+                                for v_i in range(0, len(vectors), 100):
+                                    idx.upsert(vectors=vectors[v_i:v_i+100], namespace=ws_namespace)
+                            batch_text = "" # 🧹 تفريغ الذاكرة (Garbage Collection)
+                            
+                    # معالجة الدفعة المتبقية
+                    if batch_text.strip():
+                        status_text.text(f"جاري تخزين الدفعة الأخيرة من الـ PDF...")
+                        chunks = smart_chunk_text(batch_text)
+                        if chunks:
+                            total_chunks += len(chunks)
+                            response_data = get_universal_embeddings(chunks, emb_key, emb_url, emb_model)
+                            vectors = []
+                            for item in response_data:
+                                vectors.append((f"{file_id}_final_{item['index']}", item['embedding'], {"text": chunks[item['index']], "filename": uploaded_file.name, "file_id": file_id}))
+                            for v_i in range(0, len(vectors), 100):
+                                idx.upsert(vectors=vectors[v_i:v_i+100], namespace=ws_namespace)
                         
-                        vectors.append((vec_id, emb_val, {"text": chunks[i], "filename": uploaded_file.name, "file_id": file_id, "is_master_index": is_master_index}))
-                        # -----------------------------------------------------------
-                        
-                    batch_size = 100
-                    for i in range(0, len(vectors), batch_size):
-                        idx.upsert(vectors=vectors[i:i+batch_size], namespace=ws_namespace)
-                        
-                    print(f"[DEBUG] اكتمل تخزين الملف {uploaded_file.name} في Pinecone بنجاح.")
+                    progress_bar.progress(100)
+                    status_text.text("✅ تمت الفهرسة بنجاح بالتدفق المباشر!")
                     
-                    # Update Memory
-                    uploaded_files = CFG.get('UPLOADED_FILES', {})
-                    uploaded_files[file_id] = {
+                    file_metadata = {
                         "name": uploaded_file.name,
-                        "size": f"{uploaded_file.size / 1024:.1f} KB",
-                        "date": get_local_now().strftime("%Y-%m-%d %H:%M"),
-                        "chunks": len(chunks),
+                        "type": ext,
+                        "chunks": total_chunks,
+                        "size_kb": round(uploaded_file.size / 1024, 2),
+                        "timestamp": get_local_now().strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "مفهرس 🟢"
                     }
-                    CFG['UPLOADED_FILES'] = uploaded_files
-                    CFG['KNOWLEDGE_BASE'] = "محدثة ببيانات جديدة"
-                    save_config(CFG)
-                    
-                    progress_bar.progress(100)
-                    status_text.success("✅ اكتملت المعالجة والفهرسة بنجاح! الملف جاهز الآن في عقل المدير.")
+                    st.session_state.app_config.setdefault('UPLOADED_FILES', {})[file_id] = file_metadata
+                    if FIREBASE_CONNECTED and db and 'workspace_id' in st.session_state:
+                        try: get_workspace_doc().update({f'UPLOADED_FILES.{file_id}': file_metadata})
+                        except Exception: pass
+                    st.success(f"تم تخزين {total_chunks} مقطع بنجاح في قاعدة المعرفة.")
                     time.sleep(2)
                     st.rerun()
-            except Exception as e:
-                progress_bar.empty()
-                status_text.empty()
-                st.error(f"❌ حدث خطأ غير متوقع أثناء المعالجة: {e}")
-                print(f"[DEBUG] File Processing Fatal Error: {e}")
+
+                else:
+                    # 1. Extraction (للملفات الأخرى)
+                    status_text.text("1/4: جاري فك تشفير واستخراج النصوص من الملف...")
+                    print(f"[DEBUG] بدء استخراج النص من {uploaded_file.name}")
+                    raw_text, error = advanced_text_extraction(uploaded_file)
+                    
+                    if error:
 
     st.markdown("<br>### 📂 السجل الشامل للملفات المفهرسة", unsafe_allow_html=True)
     uploaded_files = CFG.get('UPLOADED_FILES', {})
@@ -3538,9 +3636,14 @@ def render_chat_fragment(curr_user, sys_prompt_context, CFG):
                         cols = [str(c) for c in df_up.columns]
                         file_content_text += '| ' + ' | '.join(cols) + ' |\n'
                         file_content_text += '| ' + ' | '.join(['---'] * len(cols)) + ' |\n'
+                        row_count_up = 0
                         for row in df_up.values.tolist():
+                            if row_count_up > 100:
+                                file_content_text += f"| ... | تم قطع باقي الصفوف (تجاوز 100 صف) لحماية الذاكرة | ... |\n"
+                                break
                             row_strs = [str(val).replace('\n', ' ').replace('|', '-') for val in row]
                             file_content_text += '| ' + ' | '.join(row_strs) + ' |\n'
+                            row_count_up += 1
                     else:
                         file_bytes = uploaded_file.getvalue()
                         excel_data = io.BytesIO(file_bytes)
@@ -3555,9 +3658,14 @@ def render_chat_fragment(curr_user, sys_prompt_context, CFG):
                             cols = [str(c) for c in df_temp.columns]
                             file_content_text += '| ' + ' | '.join(cols) + ' |\n'
                             file_content_text += '| ' + ' | '.join(['---'] * len(cols)) + ' |\n'
+                            row_count_up = 0
                             for row in df_temp.values.tolist():
+                                if row_count_up > 100:
+                                    file_content_text += f"| ... | تم قطع باقي الصفوف (تجاوز 100 صف) لحماية الذاكرة | ... |\n"
+                                    break
                                 row_strs = [str(val).replace('\n', ' ').replace('|', '-') for val in row]
                                 file_content_text += '| ' + ' | '.join(row_strs) + ' |\n'
+                                row_count_up += 1
                 elif ext == 'docx':
                     try:
                         import docx
@@ -3574,7 +3682,7 @@ def render_chat_fragment(curr_user, sys_prompt_context, CFG):
             if not final_content:
                 final_content = f"📁 [تم إرفاق ملف: {uploaded_file.name}]"
             if file_content_text:
-                final_content += f"\n\n[محتوى الملف المرفق ({uploaded_file.name})]:\n{file_content_text[:3000000]}"
+                final_content += f"\n\n[محتوى الملف المرفق ({uploaded_file.name})]:\n{file_content_text[:50000]}"
             if vision_image:
                 final_content += f"\n\n[صورة مرفقة: {uploaded_file.name}]"
         else:
@@ -3620,64 +3728,65 @@ def render_chat_fragment(curr_user, sys_prompt_context, CFG):
                     user_notifs.append(notif_msg)
                     st.session_state.app_config['NOTIFICATIONS'][emp_full] = user_notifs[-30:]
                     
-                    fs_updates = {f'GLOBAL_TASKS.{task_id}': new_task, f'NOTIFICATIONS.{emp_full}': st.session_state.app_config['NOTIFICATIONS'][emp_full]}
-                    
-                    rephrase_prompt = f"أعد صياغة التكليف التالي للموظف ({emp_name}) بأسلوب المدير التنفيذي (العقل المدبر) بطريقة حازمة ومباشرة. ممنوع استخدام أي مقدمات أو خاتمات. ممنوع استخدام أي رموز مثل النجمات أو الشرطات. استخدم الترقيم فقط (1، 2) إذا لزم الأمر. التكليف: '{task_desc}'"
-                    try:
-                        ai_rephrased = call_universal_ai([{"role": "user", "content": rephrase_prompt}], json_mode=False)
-                        ai_rephrased = ai_rephrased.replace('-', '').replace('--', '').replace('*', '').replace('#', '')
-                    except:
-                        ai_rephrased = f"مطلوب إنجاز الآتي: {task_desc}"
+                        if matched_emp:
+                        task_id = f"#T-{int(time.time()*1000) % 100000}"
+                        now_str = get_local_now().strftime("%Y-%m-%d")
+                        target_emp_full = next((f"{e['name']} - {e['role']}" for e in CFG.get('EMPLOYEES', []) if e['name'] == matched_emp), matched_emp)
+                        new_task = {'emp': matched_emp, 'emp_full': target_emp_full, 'task': assigned_task, 'status': 'pending', 'date': now_str}
+                        notif_msg = f"📌 تكليف ذكي جديد [{task_id}]، يرجى الدخول لمكتبك ومراجعة الشات."
                         
-                    emp_task_msg = {"role": "assistant", "content": f"📌 تكليف جديد:\n{ai_rephrased}", "linked_tasks": [task_id]}
-                    if emp_full not in st.session_state.all_chats:
-                        st.session_state.all_chats[emp_full] = load_user_chats(emp_full).get(emp_full, [])
-                    st.session_state.all_chats[emp_full].append(emp_task_msg)
-                    log_message(emp_full, emp_task_msg)
-                    try: overwrite_chat_for_user(emp_full, st.session_state.all_chats[emp_full])
-                    except: pass
-                    
-                    if FIREBASE_CONNECTED and db and 'workspace_id' in st.session_state:
+                        fs_updates[f'GLOBAL_TASKS.{task_id}'] = new_task
+                        
+                        user_notifs = st.session_state.app_config.setdefault('NOTIFICATIONS', {}).setdefault(target_emp_full, [])
+                        user_notifs.append(notif_msg)
+                        st.session_state.app_config['NOTIFICATIONS'][target_emp_full] = user_notifs[-30:]
+                        fs_updates[f'NOTIFICATIONS.{target_emp_full}'] = st.session_state.app_config['NOTIFICATIONS'][target_emp_full]
+                        
+                        st.session_state.app_config.setdefault('GLOBAL_TASKS', {})[task_id] = new_task
+                        ai_final_msg['content'] += f"\n\n✔️ تم تكليف الموظف ({matched_emp}) بالمهمة وإرسال إشعار فوري له."
+                        ai_final_msg['linked_tasks'] = ai_final_msg.get('linked_tasks', []) + [task_id]
+                        
+                        rephrase_prompt = f"أعد صياغة التكليف التالي للموظف ({matched_emp}) بأسلوب المدير التنفيذي (العقل المدبر) بطريقة حازمة ومباشرة. ممنوع استخدام أي مقدمات أو خاتمات. ممنوع استخدام أي رموز مثل النجمات أو الشرطات. استخدم الترقيم فقط (1، 2) إذا لزم الأمر. التكليف: '{assigned_task}'"
                         try:
-                            get_workspace_doc().update(fs_updates)
-                            get_workspace_doc().collection('Chats').document(emp_full).set({'messages': st.session_state.all_chats[emp_full]})
-                        except Exception: pass
-                
-                force_ai_reply = "تم الابلاغ , و يتولى العقل الذكي للتطبيق متابعة التنفيذ"
+                            ai_rephrased = call_universal_ai([{"role": "user", "content": rephrase_prompt}], json_mode=False)
+                            ai_rephrased = ai_rephrased.replace('-', '').replace('--', '').replace('*', '').replace('#', '') 
+                        except:
+                            ai_rephrased = f"مطلوب إنجاز: {assigned_task}"
+                            
+                        emp_ai_msg = {"role": "assistant", "content": f"📌 تكليف إداري للمتابعة:\n{ai_rephrased}", "linked_tasks": [task_id]}
+                        if target_emp_full not in st.session_state.all_chats:
+                            st.session_state.all_chats[target_emp_full] = load_user_chats(target_emp_full).get(target_emp_full, [])
+                        st.session_state.all_chats[target_emp_full].append(emp_ai_msg)
+                        log_message(target_emp_full, emp_ai_msg)
+                        try: overwrite_chat_for_user(target_emp_full, st.session_state.all_chats[target_emp_full])
+                        except: pass
+                        
+                        if FIREBASE_CONNECTED and db and 'workspace_id' in st.session_state:
+                            try: get_workspace_doc().collection('Chats').document(target_emp_full).set({'messages': st.session_state.all_chats[target_emp_full]})
+                            except: pass
 
-        st.session_state.all_chats[curr_user].append(user_msg)
-        sync_state('all_chats')
-        
-        user_msg_log = user_msg.copy()
-        user_msg_log['user'] = curr_user
-        log_message(curr_user, user_msg_log)
-        try:
-            overwrite_chat_for_user(curr_user, st.session_state.all_chats[curr_user])
-        except Exception:
-            st.session_state.all_chats[curr_user] = st.session_state.all_chats.get(curr_user, [])
-        
-        with chat_area:
-            with st.chat_message("user"):
-                st.markdown("<span class='msg-user' style='display:none;'></span>", unsafe_allow_html=True)
-                
-                display_user_content = final_content
-                
-                img_tag = ""
-                if vision_image:
-                    img_tag = f"<br><img src='{vision_image}' style='max-height: 250px; max-width: 100%; object-fit: contain; border-radius: 12px; margin-top: 12px; border: 1px solid rgba(0,242,255,0.3); box-shadow: 0 4px 15px rgba(0,0,0,0.15); display: block; cursor: pointer;'>"
-                
-                st.markdown(f"""
-                <div class='chat-wrapper' style='display: flex; flex-direction: column; align-items: flex-start; width: 100%;'>
-                    <div class='chat-bubble' dir='auto'>{neonize_numbers(display_user_content)}{img_tag}</div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            fs_updates = {}
-            ai_final_msg_log = {}
-            
-            if not is_working_hours and curr_user != "المدير العام":
-                auto_reply = "عذراً نحن خارج أوقات العمل، أراك غداً"
-                ai_final_msg = {"role": "assistant", "content": auto_reply}
+                    else:
+                        ai_final_msg['content'] += f"\n\n❌ عذراً، لم أتمكن من العثور على موظف مسجل باسم '{target_emp}'."
+
+                if fs_updates:
+                    ws_id = st.session_state.get('workspace_id')
+                    safe_id = "".join(c for c in str(ws_id) if c.isalnum() or c in ('_', '-'))
+                    if safe_id not in st.session_state.offline_db['Workspaces']:
+                        st.session_state.offline_db['Workspaces'][safe_id] = {}
+                    
+                    for k, v in fs_updates.items():
+                        keys = k.split('.')
+                        curr_dict = st.session_state.offline_db['Workspaces'][safe_id]
+                        for i, key in enumerate(keys[:-1]):
+                            if key not in curr_dict or not isinstance(curr_dict[key], dict):
+                                curr_dict[key] = {}
+                            curr_dict = curr_dict[key]
+                        curr_dict[keys[-1]] = v
+                    
+                    # توجيه التحديثات الحية إلى المصدات (Debouncer) لمنع انهيار Quota الفايربيز
+                    if 'pending_fs_updates' not in st.session_state: st.session_state.pending_fs_updates = {}
+                    st.session_state.pending_fs_updates.update(fs_updates)
+
                 st.session_state.all_chats[curr_user].append(ai_final_msg)
                 sync_state('all_chats')
                 
@@ -3982,30 +4091,31 @@ def render_chat_fragment(curr_user, sys_prompt_context, CFG):
                                     mgr_notifs.append(alert_msg)
                                     st.session_state.app_config['NOTIFICATIONS'][direct_manager_full_name] = mgr_notifs[-30:]
                                     
-                                    if FIREBASE_CONNECTED and db and 'workspace_id' in st.session_state:
-                                        try:
-                                            get_workspace_doc().update({f'NOTIFICATIONS.{direct_manager_full_name}': st.session_state.app_config['NOTIFICATIONS'][direct_manager_full_name]})
-                                        except Exception: pass
+                                    # التوجيه للمصدات بدلاً من الحفظ المباشر
+                                    if 'pending_fs_updates' not in st.session_state: st.session_state.pending_fs_updates = {}
+                                    st.session_state.pending_fs_updates[f'NOTIFICATIONS.{direct_manager_full_name}'] = st.session_state.app_config['NOTIFICATIONS'][direct_manager_full_name]
             
-            # الجراحة 3: منع التحديث الشامل القاتل للمعالج واقتصاره على مربع الشات فقط
+            # إصلاح: حل مشكلة (UI Desync) باستخدام الحقن العكسي (Reverse Injection)
+            if fs_updates and 'sidebar_notif_placeholder' in st.session_state:
+                with st.session_state.sidebar_notif_placeholder.container():
+                    st.warning("🔔 لديك إشعارات/مهام جديدة! (تم التحديث اللحظي)")
             st.rerun(scope="fragment")
 
-    # الجراحة 4: تبطئة المزامنة الحية ومنعها من التراكم اللانهائي
+    # الجراحة 4: تبطئة المزامنة الحية وإدارة الذاكرة (تنظيف المتصفح من الـ Intervals المتراكمة)
+    safe_js_id = "".join([c for c in curr_user if c.isalnum()])
     js_realtime_pull = f"""
     <script>
-    if(!window.mudirPullHackLoaded_{curr_user.split(' ')[0]}) {{
-        window.mudirPullHackLoaded_{curr_user.split(' ')[0]} = true;
-        setInterval(function() {{
-            const lastPing = localStorage.getItem('mudir_ping_{curr_user}');
-            if (lastPing && lastPing > window.lastSeenPing) {{
-                window.lastSeenPing = lastPing;
-                const doc = window.parent.document;
-                const refreshBtn = Array.from(doc.querySelectorAll('button')).find(el => el.textContent.includes('مزامنة الرسائل'));
-                if (refreshBtn) refreshBtn.click();
-            }}
-        }}, 15000); // كل 15 ثانية بدلا من الدوران المستمر
-        window.lastSeenPing = localStorage.getItem('mudir_ping_{curr_user}') || Date.now();
-    }}
+    if(window['mudirPullHackTimer_{safe_js_id}']) clearInterval(window['mudirPullHackTimer_{safe_js_id}']);
+    window['mudirPullHackTimer_{safe_js_id}'] = setInterval(function() {{
+        const lastPing = localStorage.getItem('mudir_ping_{curr_user}');
+        if (lastPing && lastPing > window.lastSeenPing) {{
+            window.lastSeenPing = lastPing;
+            const doc = window.parent.document;
+            const refreshBtn = Array.from(doc.querySelectorAll('button')).find(el => el.textContent.includes('مزامنة الرسائل'));
+            if (refreshBtn) refreshBtn.click();
+        }}
+    }}, 15000); // كل 15 ثانية بدلا من الدوران المستمر
+    window.lastSeenPing = localStorage.getItem('mudir_ping_{curr_user}') || Date.now();
     </script>
     """
     components.html(js_realtime_pull, height=0, width=0)
@@ -4513,10 +4623,12 @@ def render_ai():
                                 st.rerun()
                         
                         if is_chat_open:
-                            # [UI HACK] الجراحة: حقن كود جافاسكريبت يقوم بالضغط على زر "مزامنة الرسائل" تلقائياً
+                            # [UI HACK] الجراحة: حقن كود جافاسكريبت مع تنظيف الذاكرة (Clear Timeout) لمنع تشنج المتصفح
+                            safe_js_emp_id = "".join([c for c in emp_short if c.isalnum()])
                             js_live_monitor = f"""
                             <script>
-                            setTimeout(function() {{
+                            if(window['mudirLiveMonitorTimer_{safe_js_emp_id}']) clearTimeout(window['mudirLiveMonitorTimer_{safe_js_emp_id}']);
+                            window['mudirLiveMonitorTimer_{safe_js_emp_id}'] = setTimeout(function() {{
                                 const doc = window.parent.document;
                                 const syncBtn = Array.from(doc.querySelectorAll('button')).find(el => el.textContent.includes('مزامنة الرسائل'));
                                 if (syncBtn) syncBtn.click();
@@ -4610,11 +4722,9 @@ def render_ai():
                             try: overwrite_chat_for_user(target_emp_full, st.session_state.all_chats[target_emp_full])
                             except: pass
 
-                            if FIREBASE_CONNECTED and db and 'workspace_id' in st.session_state:
-                                try:
-                                    get_workspace_doc().update(fs_updates)
-                                    get_workspace_doc().collection('Chats').document(target_emp_full).set({'messages': st.session_state.all_chats[target_emp_full]})
-                                except Exception: pass
+                            # دفع التحديثات العاجلة للمصدات
+                            if 'pending_fs_updates' not in st.session_state: st.session_state.pending_fs_updates = {}
+                            st.session_state.pending_fs_updates.update(fs_updates)
                             
                             st.success(f"✔️ تم إرسال التكليف وتسجيله للموظف {target_emp_short} بنجاح!")
                         else:
@@ -5108,7 +5218,9 @@ def render_settings():
     o_url = st.text_input("رابط الخادم (URL)", value=CFG.get('ODOO_URL', ''))
     o_db = st.text_input("قاعدة البيانات (DB)", value=CFG.get('ODOO_DB', ''))
     o_usr = st.text_input("المستخدم (User)", value=CFG.get('ODOO_USER', ''))
-    o_pwd = st.text_input("كلمة المرور (Password)", value=CFG.get('ODOO_PASS', ''), type="password")
+    
+    o_pwd_display = decrypt_password(CFG.get('ODOO_PASS', '')) if is_encrypted(CFG.get('ODOO_PASS', '')) else CFG.get('ODOO_PASS', '')
+    o_pwd = st.text_input("كلمة المرور (Password)", value=o_pwd_display, type="password")
     
     if st.button("💾 حفظ وفحص الاتصال بقاعدة البيانات (Odoo)", key="save_test_odoo_conn", use_container_width=True, type="primary"):
         try:
@@ -5131,10 +5243,8 @@ def render_settings():
             # 1. الحفظ في السحابة بالنسخة المشفرة للحماية
             get_workspace_doc().set(current_cfg, merge=True)
             
-            # 2. الجراحة الدقيقة: حقن الذاكرة الحية بالباسورد الحقيقي لكي لا يفشل Odoo!
-            mem_cfg = current_cfg.copy()
-            mem_cfg['ODOO_PASS'] = o_pwd
-            st.session_state.app_config.update(mem_cfg)
+            # 2. الجراحة الدقيقة: حقن الذاكرة الحية بالباسورد المشفّر فقط!
+            st.session_state.app_config.update(current_cfg)
             
             # 3. مسح الكاش لإجبار خوارزميات الاستخراج على استخدام الكلمة الجديدة فوراً
             try: fetch_master_data.clear()
